@@ -26,7 +26,7 @@ hyper_params = {"img_size": 500,
                 "variances": [0.1, 0.1, 0.2, 0.2],
                 "pos_threshold" : 0.7,
                 "neg_threshold" : 0.3,
-                "batch_size" : 16,
+                "batch_size" : 8,
                 "iters" : 20000,
                 }
 hyper_params['anchor_count'] = len(hyper_params['anchor_ratios']) * len(hyper_params['anchor_scales'])
@@ -37,7 +37,7 @@ img_size = hyper_params["img_size"]
 
 
 #%%
-info_dir = r"C:\won\data\pascal_voc\voc2007_np"
+info_dir = r"C:\won\data\pascal_voc\voc2007_np_inst"
 info = np.load(info_dir + r"\info.npy", allow_pickle=True)
 
 labels = info[0]["labels"]
@@ -188,6 +188,33 @@ class RoIDelta(Layer):
         return roi_bbox_deltas, roi_bbox_labels
 
 #%%
+class RoIMask(Layer):
+    def __init__(self, hyper_params, **kwargs):
+        super(RoIMask, self).__init__(**kwargs)
+        self.total_labels = hyper_params["total_labels"]
+
+    def call(self, inputs):
+        roi_bboxes = inputs[0]
+        gt_mask = inputs[1]
+
+        roi_mask = []
+        for i in range(tf.shape(roi_bboxes)[0]):
+            mask_per_img = []
+            for j in range(tf.shape(roi_bboxes)[1]):
+                roi_coor = np.round(roi_bboxes[i][j] * img_size)
+                roi_mask_per_img = gt_mask[i][int(roi_coor[0]):int(roi_coor[2]), int(roi_coor[1]):int(roi_coor[3])]
+                try:
+                    roi_mask_per_img = tf.image.resize(roi_mask_per_img, (14,14), method='nearest')
+                except:
+                    roi_mask_per_img = tf.zeros(shape=(14,14,1))
+                mask_per_img.append(roi_mask_per_img)
+            roi_mask.append(np.array(mask_per_img))
+        roi_mask = tf.convert_to_tensor(roi_mask)
+        roi_mask = tf.cast(roi_mask, dtype=tf.int32)
+        roi_mask = tf.one_hot(roi_mask, depth = self.total_labels, axis=-1)
+        roi_mask = tf.reshape(roi_mask,(8, 1500, 14, 14, 21))
+        return roi_mask
+#%%
 class Decoder(Layer):
     def __init__(self, hyper_params, max_total_size=200, score_threshold=0.7, **kwargs):
         super(Decoder, self).__init__(**kwargs)
@@ -234,16 +261,18 @@ class Decoder(Layer):
 rpn_model = model_utils.RPN(hyper_params)
 input_shape = (None, 500, 500, 3)
 rpn_model.build(input_shape)
-# rpn_model.load_weights(r'C:\won\frcnn\atmp5\rpn_weights\weights')
+rpn_model.load_weights(r'C:\won\frcnn\atmp1\rpn_weights\weights')
 
 NMS = RoIBBox(anchors, hyper_params, test=False, name='roi_bboxes')
 Pooling = RoIPooling(hyper_params, name="roi_pooling")
+Mask = RoIMask(hyper_params, name="roi_mask")
 Delta = RoIDelta(hyper_params, name='roi_deltas')
 
-frcnn_model = model_utils.DTN(hyper_params)
+mrcnn_model = model_utils.DTN(hyper_params)
 input_shape = (None, hyper_params['train_nms_topn'], 7, 7, 512)
-frcnn_model.build(input_shape)
-# frcnn_model.load_weights(r'C:\won\frcnn\atmp5\frcnn_weights\weights')
+mrcnn_model.build(input_shape)
+# mrcnn_model.load_weights(r'C:\won\frcnn\atmp5\frcnn_weights\weights')
+
 #%%
 optimizer1 = keras.optimizers.Adam(learning_rate=1e-5)
 optimizer2 = keras.optimizers.Adam(learning_rate=1e-5)
@@ -266,19 +295,20 @@ def train_step1(img, bbox_deltas, bbox_labels, hyper_params):
 
 #%%
 @tf.function
-def train_step2(pooled_roi, roi_delta):
+def train_step2(pooled_roi, roi_delta, roi_mask):
     with tf.GradientTape(persistent=True) as tape:
         '''DTNnition'''
-        frcnn_pred = frcnn_model(pooled_roi, training=True)
+        mrcnn_pred = mrcnn_model(pooled_roi, training=True)
         
-        frcnn_reg_loss = loss_utils.dtn_reg_loss(frcnn_pred[0], roi_delta[0], roi_delta[1], hyper_params)
-        frcnn_cls_loss = loss_utils.dtn_cls_loss(frcnn_pred[1], roi_delta[1])
-        frcnn_loss = frcnn_reg_loss + frcnn_cls_loss
+        mrcnn_reg_loss = loss_utils.dtn_reg_loss(mrcnn_pred[0], roi_delta[0], roi_delta[1], hyper_params)
+        mrcnn_cls_loss = loss_utils.dtn_cls_loss(mrcnn_pred[1], roi_delta[1])
+        mrcnn_msk_loss = loss_utils.dtn_msk_loss(mrcnn_pred[2], roi_mask)
+        mrcnn_loss = mrcnn_reg_loss + mrcnn_cls_loss
 
-    grads_frcnn = tape.gradient(frcnn_loss, frcnn_model.trainable_weights)
-    optimizer2.apply_gradients(zip(grads_frcnn, frcnn_model.trainable_weights))
+    grads_frcnn = tape.gradient(mrcnn_loss, mrcnn_model.trainable_weights)
+    optimizer2.apply_gradients(zip(grads_frcnn, mrcnn_model.trainable_weights))
 
-    return frcnn_reg_loss, frcnn_cls_loss
+    return mrcnn_reg_loss, mrcnn_cls_loss, mrcnn_msk_loss
 
 #%%
 def save_dict_to_file(dic,dict_dir):
@@ -287,7 +317,7 @@ def save_dict_to_file(dic,dict_dir):
     f.close()
 
 #%%
-train_dir = r"C:\won\data\pascal_voc\voc2007_np\train_val\\"
+train_dir = r"C:\won\data\pascal_voc\voc2007_np_inst\train_val\\"
 
 pos_num_lst = []
 step = 0
@@ -300,7 +330,7 @@ for _ in progress_bar:
     chk_pos_num = []
 
     batch_data = np.array([np.load(train_dir + train_filename[i] + ".npy", allow_pickle=True) for i in list(np.random.randint(0, train_total_items, batch_size))])
-    img, gt_boxes, gt_labels = preprocessing_utils.preprocessing(batch_data, hyper_params["batch_size"], hyper_params["img_size"], hyper_params["img_size"], evaluate=False, augmentation=True) 
+    img, gt_boxes, gt_labels, gt_mask = preprocessing_utils.preprocessing(batch_data, hyper_params["batch_size"], hyper_params["img_size"], hyper_params["img_size"], evaluate=False, augmentation=True) 
     bbox_deltas, bbox_labels, chk_pos_num = rpn_utils.calculate_rpn_actual_outputs(anchors, gt_boxes, gt_labels, hyper_params, chk_pos_num)
 
     pos_num_lst.append(chk_pos_num)
@@ -309,26 +339,27 @@ for _ in progress_bar:
     roi_bboxes, _ = NMS([rpn_reg_output, rpn_cls_output, gt_labels])
     pooled_roi = Pooling([feature_map, roi_bboxes])
     roi_delta = Delta([roi_bboxes, gt_boxes, gt_labels])
-    frcnn_reg_loss, frcnn_cls_loss = train_step2(pooled_roi, roi_delta)
+    roi_mask = Mask([roi_bboxes, gt_mask])
+    mrcnn_reg_loss, mrcnn_cls_loss, mrcnn_msk_loss = train_step2(pooled_roi, roi_delta, roi_mask)
 
     step += 1
     
-    progress_bar.set_description('iteration {}/{} | rpn_reg {:.4f}, rpn_cls {:.4f}, rpn {:.4f}, frcnn_reg {:.4f}, frcnn_cls {:.4f}, frcnn {:.4f}, loss {:.4f}'.format(
+    progress_bar.set_description('iteration {}/{} | rpn_reg {:.4f}, rpn_cls {:.4f}, mrcnn_reg {:.4f}, mrcnn_cls {:.4f}, mrcnn_msk {:.4f}, loss {:.4f}'.format(
         step, hyper_params['iters'], 
-        rpn_reg_loss.numpy(), rpn_cls_loss.numpy(), (rpn_reg_loss + rpn_cls_loss).numpy(), frcnn_reg_loss.numpy(), frcnn_cls_loss.numpy(), (frcnn_reg_loss + frcnn_cls_loss).numpy(), (rpn_reg_loss + rpn_cls_loss + frcnn_reg_loss + frcnn_cls_loss).numpy()
+        rpn_reg_loss.numpy(), rpn_cls_loss.numpy(), mrcnn_reg_loss.numpy(), mrcnn_cls_loss.numpy(), mrcnn_msk_loss.numpy(), (rpn_reg_loss + rpn_cls_loss + mrcnn_reg_loss + mrcnn_cls_loss + mrcnn_msk_loss).numpy()
     )) 
     
     if step % 500 == 0:
-        print(progress_bar.set_description('iteration {}/{} | rpn_reg {:.4f}, rpn_cls {:.4f}, rpn {:.4f}, frcnn_reg {:.4f}, frcnn_cls {:.4f}, frcnn {:.4f}, loss {:.4f}'.format(
+        print(progress_bar.set_description('iteration {}/{} | rpn_reg {:.4f}, rpn_cls {:.4f}, mrcnn_reg {:.4f}, mrcnn_cls {:.4f}, mrcnn_msk {:.4f}, loss {:.4f}'.format(
             step, hyper_params['iters'], 
-            float(rpn_reg_loss), float(rpn_cls_loss), float(rpn_reg_loss + rpn_cls_loss), float(frcnn_reg_loss), float(frcnn_cls_loss), float(frcnn_reg_loss + frcnn_cls_loss), float(rpn_reg_loss + rpn_cls_loss + frcnn_reg_loss + frcnn_cls_loss)
+            float(rpn_reg_loss), float(rpn_cls_loss), float(mrcnn_reg_loss), float(mrcnn_cls_loss), float(mrcnn_msk_loss), float(rpn_reg_loss + rpn_cls_loss + mrcnn_reg_loss + mrcnn_cls_loss + mrcnn_msk_loss)
         )))
 
 print("Time taken: %.2fs" % (time.time() - start_time))
 print("pos num mean : ", np.mean(pos_num_lst), "pos num std : ", np.std(pos_num_lst))
 #%%
 i = 1
-res_dir = r'C:\won\frcnn\atmp'
+res_dir = r'C:\won\mrcnn\atmp'
 
 tmp = True
 while tmp :
@@ -343,13 +374,11 @@ res_dir = res_dir + str(i)
 
 save_dict_to_file(hyper_params, res_dir + r'\hyper_params')
 os.makedirs(res_dir + r'\rpn_weights')
-os.makedirs(res_dir + r'\frcnn_weights')
-os.makedirs(res_dir + r'\res_nms')
-os.makedirs(res_dir + r'\res_final_bbox')
-os.makedirs(res_dir + r'\res_frcnn')
+os.makedirs(res_dir + r'\mrcnn_weights')
+os.makedirs(res_dir + r'\res_mrcnn')
 #%%
 rpn_model.save_weights(res_dir + r'\rpn_weights\weights')
-frcnn_model.save_weights(res_dir + r'\frcnn_weights\weights')
+mrcnn_model.save_weights(res_dir + r'\mrcnn_weights\weights')
 print("Weights Saved")
 
 
@@ -362,86 +391,24 @@ NMS = RoIBBox(anchors, hyper_params, test=True, name='roi_bboxes')
 Pooling = RoIPooling(hyper_params, name="roi_pooling")
 decode = Decoder(hyper_params)
 
-test_dir = r"C:\won\data\pascal_voc\voc2007_np\test\\"
+test_dir = r"C:\won\data\pascal_voc\voc2007_np_inst\test\\"
 
+attempts = 15
 for attempt in range(attempts):
 
     res_filename = [test_filename[i] for i in range(attempt*batch_size, attempt*batch_size + batch_size)]
-    batch_data = np.array([np.load(test_dir + test_filename[i] + ".npy", allow_pickle=True) for i in range(attempt*batch_size, attempt*batch_size+batch_size)])
 
-    img, gt_boxes, gt_labels = preprocessing_utils.preprocessing(batch_data, hyper_params["batch_size"], hyper_params["img_size"], hyper_params["img_size"], evaluate=True)
+    batch_data = np.array([np.load(test_dir + test_filename[i] + ".npy", allow_pickle=True) for i in range(attempt*batch_size, attempt*batch_size+batch_size)])
+    img, gt_boxes, gt_labels, gt_mask = preprocessing_utils.preprocessing(batch_data, hyper_params["batch_size"], hyper_params["img_size"], hyper_params["img_size"], evaluate=True)
     
     rpn_reg_output, rpn_cls_output, feature_map = rpn_model.predict(img)
     roi_bboxes, roi_scores = NMS([rpn_reg_output, rpn_cls_output, gt_labels])
     pooled_roi = Pooling([feature_map, roi_bboxes])
-    pred_deltas, pred_label_probs = frcnn_model.predict(pooled_roi)
+    pred_deltas, pred_label_probs, pred_mask = mrcnn_model.predict(pooled_roi)
+    
     final_bboxes, final_labels, final_scores = decode([roi_bboxes, pred_deltas, pred_label_probs])
 
     img_size = img.shape[1]
-    
-##### NMS OUTPUT #####
-    for i, image in enumerate(img):
-
-        y1 = roi_bboxes[i][...,0] * img_size
-        x1 = roi_bboxes[i][...,1] * img_size
-        y2 = roi_bboxes[i][...,2] * img_size
-        x2 = roi_bboxes[i][...,3] * img_size
-
-        denormalized_box = tf.round(tf.stack([y1, x1, y2, x2], axis=-1))
-
-        _, top_indices = tf.nn.top_k(roi_scores[i], 2)
-        #
-        selected_rpn_bboxes = tf.gather(denormalized_box, top_indices, batch_dims=0)
-
-        #
-        colors = 234 
-
-        image = tf.keras.preprocessing.image.array_to_img(image)
-        width, height = image.size
-        draw = ImageDraw.Draw(image)
-        
-        for bbox in selected_rpn_bboxes:
-            y1, x1, y2, x2 = tf.split(bbox, 4, axis = -1)
-
-            draw.rectangle((x1, y1, x2, y2), outline=colors, width=3)
-        
-        plt.figure()
-        plt.imshow(image)
-        plt.savefig(res_dir + r'\res_nms\\' + res_filename[i] + '.png')
-    
-    
-##### FINAL BOUNDING BOXES #####
-    for i , image in enumerate(img):
-
-        tmp = tf.reshape(pred_deltas[i], shape=(1, pred_deltas.shape[1], hyper_params['total_labels'], 4))
-        tmp *= hyper_params['variances']
-
-        expanded_roi_bboxes = tf.reshape(tf.tile(tf.expand_dims(roi_bboxes[i], -2), (1, hyper_params['total_labels'], 1)), shape=(1,hyper_params['test_nms_topn'], hyper_params['total_labels'], 4))
-        final_bboxes_ = bbox_utils.delta_to_bbox(expanded_roi_bboxes, tmp)
-
-        y1 = final_bboxes_[...,0] * img_size
-        x1 = final_bboxes_[...,1] * img_size
-        y2 = final_bboxes_[...,2] * img_size
-        x2 = final_bboxes_[...,3] * img_size
-
-        denormalized_box = tf.round(tf.stack([y1, x1, y2, x2], axis=-1))
-
-        colors = [57, 140, 234]
-
-        image = tf.keras.preprocessing.image.array_to_img(image)
-        width, height = image.size
-        draw = ImageDraw.Draw(image)
-        for j in range(3):
-            color = colors[j]
-            tmp_box = denormalized_box[0][j]
-            bbox = tmp_box[0]
-            y1, x1, y2, x2 = tf.split(bbox, 4, axis = -1)
-            draw.rectangle((x1, y1, x2, y2), outline=color, width=3)
-            
-        plt.figure()
-        plt.imshow(image)
-        plt.savefig(res_dir + r'\res_final_bbox\\' + res_filename[i] + '.png')
-
 ##### FASTER R-CNN RESULT #####
     for i , image in enumerate(img):
 
@@ -473,6 +440,6 @@ for attempt in range(attempts):
         
         plt.figure()
         plt.imshow(image)
-        plt.savefig(res_dir + r'\res_frcnn\\' + res_filename[i] + '.png')
+        plt.savefig(res_dir + r'\res_mrcnn\\' + res_filename[i] + '.png')
 
 # %%

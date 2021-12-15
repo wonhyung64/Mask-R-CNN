@@ -75,3 +75,7 @@ def dtn_cls_loss(pred, true):
     total_boxes = tf.maximum(1.0, tf.reduce_sum(mask))
 
     return conf_loss / total_boxes
+
+def dtn_msk_loss(pred, true):
+    lf =  -tf.reduce_sum(true * tf.math.log(pred + 1e-7) + (1-true) * tf.math.log(1 - pred + 1e-7))
+    return lf
